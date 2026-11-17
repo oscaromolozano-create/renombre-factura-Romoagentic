@@ -1,0 +1,6 @@
+{
+  "name": "FolioClaro — Renombrador Inteligente de Facturas",
+  "description": "Aplicación empresarial para extraer datos de facturas PDF e imágenes y renombrarlas automáticamente según fecha, número, proveedor o formatos personalizados.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
