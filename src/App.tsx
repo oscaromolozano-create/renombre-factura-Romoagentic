@@ -49,6 +49,51 @@ function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
+async function prepareExtractionPayload(
+  file: File,
+  mimeType: string
+): Promise<{ mimeType: string; base64Data: string }> {
+  const TWO_MB = 2 * 1024 * 1024;
+  if (mimeType.startsWith('image/') && file.size > TWO_MB) {
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('No se pudo leer la imagen.'));
+        reader.readAsDataURL(file);
+      });
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error('No se pudo decodificar la imagen.'));
+        image.src = dataUrl;
+      });
+      const maxDim = 1800;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const commaIdx = compressedDataUrl.indexOf(',');
+        return {
+          mimeType: 'image/jpeg',
+          base64Data: commaIdx >= 0 ? compressedDataUrl.slice(commaIdx + 1) : compressedDataUrl,
+        };
+      }
+    } catch {
+      // Fallback to original file if canvas optimization fails
+    }
+  }
+
+  const base64Data = await readFileAsBase64(file);
+  return { mimeType, base64Data };
+}
+
 function inferMimeType(file: File): string {
   if (file.type) return file.type;
   const ext = extractExtension(file.name);
@@ -154,32 +199,60 @@ export default function App() {
     );
 
     try {
-      const base64Data = await readFileAsBase64(item.file);
+      const prepared = await prepareExtractionPayload(item.file, item.mimeType);
       const response = await fetch('/api/extract-invoice', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fileName: item.originalName,
-          mimeType: item.mimeType,
-          base64Data,
+          mimeType: prepared.mimeType,
+          base64Data: prepared.base64Data,
         }),
       });
 
-      const payload = await response.json();
-
-      if (!response.ok) {
-        throw new Error(payload?.error || 'Error al analizar la factura.');
+      const rawBody = await response.text();
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      } catch {
+        payload = {};
       }
 
+      if (!response.ok) {
+        if (response.status === 413) {
+          throw new Error(
+            'El archivo supera el límite de 4,5 MB permitido por el servidor. Reduce el peso del PDF o sube una imagen.'
+          );
+        }
+        if (response.status === 404) {
+          throw new Error(
+            'No se encontró la función /api/extract-invoice en el servidor.'
+          );
+        }
+        const serverError =
+          typeof payload.error === 'string' && payload.error
+            ? payload.error
+            : `Error del servidor (${response.status}) al analizar la factura.`;
+        throw new Error(serverError);
+      }
+
+      const str = (key: string, fallback = '') =>
+        typeof payload[key] === 'string' ? (payload[key] as string) : fallback;
+      const rawConf = payload.confidence;
+      const confidence: ExtractedInvoiceData['confidence'] =
+        rawConf === 'high' || rawConf === 'medium' || rawConf === 'low'
+          ? rawConf
+          : 'medium';
+
       const extracted: ExtractedInvoiceData = {
-        invoiceDate: payload.invoiceDate || '',
-        invoiceNumber: payload.invoiceNumber || '',
-        supplier: payload.supplier || '',
-        supplierTaxId: payload.supplierTaxId || '',
-        totalAmount: payload.totalAmount || '',
-        currency: payload.currency || 'EUR',
-        concept: payload.concept || '',
-        confidence: payload.confidence || 'medium',
+        invoiceDate: str('invoiceDate'),
+        invoiceNumber: str('invoiceNumber'),
+        supplier: str('supplier'),
+        supplierTaxId: str('supplierTaxId'),
+        totalAmount: str('totalAmount'),
+        currency: str('currency', 'EUR'),
+        concept: str('concept'),
+        confidence,
       };
 
       const hasCoreFields =
