@@ -254,6 +254,37 @@ export default function App() {
     );
   };
 
+  const handleApplyParsedData = (
+    id: string,
+    parsed: Partial<ExtractedInvoiceData>
+  ) => {
+    setItems((prev) =>
+      prev.map((item) => {
+        if (item.id !== id) return item;
+        const updatedData: ExtractedInvoiceData = {
+          ...item.data,
+          invoiceDate: parsed.invoiceDate || item.data.invoiceDate,
+          invoiceNumber: parsed.invoiceNumber || item.data.invoiceNumber,
+          supplier: parsed.supplier || item.data.supplier,
+          supplierTaxId: parsed.supplierTaxId || item.data.supplierTaxId,
+          totalAmount: parsed.totalAmount || item.data.totalAmount,
+          concept: parsed.concept || item.data.concept,
+          confidence: 'high',
+        };
+        const hasCoreFields =
+          Boolean(updatedData.invoiceDate) &&
+          Boolean(updatedData.invoiceNumber) &&
+          Boolean(updatedData.supplier);
+        return {
+          ...item,
+          data: updatedData,
+          status: hasCoreFields ? 'ready' : 'review',
+          errorMessage: undefined,
+        };
+      })
+    );
+  };
+
   const handleToggleSelect = (id: string) => {
     setItems((prev) =>
       prev.map((item) =>
@@ -519,11 +550,11 @@ export default function App() {
           </div>
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
-              03. Descarga todo listo para archivar
+              03. Revisa o apóyate en tu IA y descarga en ZIP
             </h2>
             <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-              Revisa o ajusta cualquier campo al instante y descarga todas las facturas ya
-              renombradas en un único archivo ZIP junto con su registro en Excel CSV.
+              Si alguna foto difícil queda en Revisar, ábrela para copiar la instrucción a tu
+              ChatGPT, Claude o Gemini sin API y descarga todo renombrado en un ZIP y Excel CSV.
             </p>
           </div>
         </section>
@@ -531,8 +562,8 @@ export default function App() {
 
       <footer className="bg-white border-t border-slate-200 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <span>FolioClaro · Organización automática de facturas para empresas</span>
-          <span>Compatible con PDF, PNG, JPG, WEBP y XML</span>
+          <span>FolioClaro · Organización automática de facturas por OCR local</span>
+          <span>Compatible con PDF, PNG, JPG, WEBP y XML · Sin claves de API</span>
         </div>
       </footer>
 
@@ -544,6 +575,7 @@ export default function App() {
         }
         onClose={() => setInspectedId(null)}
         onUpdateField={handleUpdateField}
+        onApplyParsedData={handleApplyParsedData}
         onRetry={handleRetryItem}
         onDownload={handleDownloadSingle}
       />

@@ -363,22 +363,26 @@ export const InvoiceTable: React.FC<InvoiceTableProps> = ({
                       </span>
                     )}
                     {item.status === 'review' && (
-                      <span
-                        className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700"
-                        title="Falta algún dato clave o requiere verificación rápida"
+                      <button
+                        type="button"
+                        onClick={() => onInspectItem(item)}
+                        className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 hover:text-amber-900 underline underline-offset-2 cursor-pointer"
+                        title="Haz clic para revisar o resolver con tu IA"
                       >
                         <AlertCircle className="w-3.5 h-3.5" />
                         Revisar
-                      </span>
+                      </button>
                     )}
                     {item.status === 'error' && (
-                      <span
-                        className="inline-flex items-center gap-1.5 text-xs font-medium text-red-700"
+                      <button
+                        type="button"
+                        onClick={() => onInspectItem(item)}
+                        className="inline-flex items-center gap-1.5 text-xs font-medium text-red-700 hover:text-red-900 underline underline-offset-2 cursor-pointer"
                         title={item.errorMessage || 'Error al leer el documento'}
                       >
                         <AlertCircle className="w-3.5 h-3.5" />
                         Error
-                      </span>
+                      </button>
                     )}
                   </td>
 

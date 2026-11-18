@@ -1,29 +1,78 @@
-import React from 'react';
-import { Download, RefreshCw, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Check, ClipboardCheck, Copy, Download, ExternalLink, RefreshCw, X } from 'lucide-react';
 import type { ExtractedInvoiceData, InvoiceItem } from '../types/invoice';
+import { buildSingleInvoiceAiPrompt, parseAiBridgeResponse } from '../utils/aiBridge';
 
 interface InvoicePreviewDrawerProps {
   item: InvoiceItem | null;
   renamedFilename: string;
   onClose: () => void;
   onUpdateField: (id: string, field: keyof ExtractedInvoiceData, value: string) => void;
+  onApplyParsedData: (id: string, parsed: Partial<ExtractedInvoiceData>) => void;
   onRetry: (item: InvoiceItem) => void;
   onDownload: (item: InvoiceItem, renamedFilename: string) => void;
 }
+
+const AI_PROVIDERS = [
+  { name: 'ChatGPT', url: 'https://chatgpt.com/' },
+  { name: 'Claude', url: 'https://claude.ai/new' },
+  { name: 'Gemini', url: 'https://gemini.google.com/app' },
+];
 
 export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
   item,
   renamedFilename,
   onClose,
   onUpdateField,
+  onApplyParsedData,
   onRetry,
   onDownload,
 }) => {
+  const [promptCopied, setPromptCopied] = useState(false);
+  const [aiResponseInput, setAiResponseInput] = useState('');
+  const [aiFeedback, setAiFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
+  useEffect(() => {
+    setAiResponseInput('');
+    setAiFeedback(null);
+    setPromptCopied(false);
+  }, [item?.id]);
+
   if (!item) return null;
 
   const isPdf =
     item.mimeType === 'application/pdf' || item.extension === '.pdf';
   const isImage = item.mimeType.startsWith('image/');
+
+  const handleCopyPrompt = async () => {
+    const prompt = buildSingleInvoiceAiPrompt(item);
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setPromptCopied(true);
+      window.setTimeout(() => setPromptCopied(false), 2200);
+    } catch {
+      // Clipboard blocked in restricted context
+    }
+  };
+
+  const applyAiText = (raw: string) => {
+    const parsed = parseAiBridgeResponse(raw);
+    if (!parsed) {
+      setAiFeedback({
+        type: 'error',
+        text: 'No se detectaron campos válidos. Pega la respuesta completa de la IA (incluyendo las llaves { ... }).',
+      });
+      return;
+    }
+    onApplyParsedData(item.id, parsed);
+    setAiFeedback({
+      type: 'success',
+      text: 'Datos aplicados y nombre actualizado automáticamente.',
+    });
+  };
 
   return (
     <div
@@ -98,8 +147,8 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
             )}
           </div>
 
-          {/* Editable Metadata Form */}
-          <div className="md:col-span-5 p-6 space-y-4">
+          {/* Editable Metadata Form + No-API AI Bridge */}
+          <div className="md:col-span-5 p-6 space-y-5 overflow-y-auto">
             <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-100">
               <h4 className="text-sm font-semibold text-slate-900">
                 Datos extraídos de la factura
@@ -110,7 +159,7 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
                 className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 hover:text-blue-700 cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
-                Releer factura
+                Releer OCR
               </button>
             </div>
 
@@ -120,7 +169,7 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
               </div>
             )}
 
-            <div className="space-y-3.5">
+            <div className="space-y-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
                   Fecha de factura (AAAA-MM-DD)
@@ -212,7 +261,7 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
               </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-100">
+            <div className="pt-3 border-t border-slate-100">
               <span className="block text-xs font-medium text-slate-500 mb-1.5">
                 Nombre de salida actual
               </span>
@@ -221,10 +270,98 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
               </div>
             </div>
 
+            {/* No-API AI Fallback Bridge */}
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+              <div>
+                <h5 className="text-xs font-semibold text-slate-900">
+                  ¿El OCR falló? Usa tu cuenta de ChatGPT, Claude o Gemini (sin API)
+                </h5>
+                <ol className="text-[11px] text-slate-600 mt-1.5 space-y-1 list-decimal list-inside">
+                  <li>Copia la instrucción o abre tu IA (se copia sola al hacer clic).</li>
+                  <li>Pega en el chat (adjunta el PDF/foto si estaba muy borrosa).</li>
+                  <li>Copia la respuesta de la IA y pégala abajo.</li>
+                </ol>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleCopyPrompt}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-800 bg-white hover:bg-slate-100 border border-slate-300 rounded-md transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {promptCopied ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      Instrucción copiada
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-slate-500" />
+                      Copiar instrucción
+                    </>
+                  )}
+                </button>
+
+                {AI_PROVIDERS.map((provider) => (
+                  <a
+                    key={provider.name}
+                    href={provider.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={handleCopyPrompt}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors whitespace-nowrap"
+                  >
+                    {provider.name}
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                ))}
+              </div>
+
+              <div className="space-y-2">
+                <textarea
+                  rows={3}
+                  value={aiResponseInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setAiResponseInput(val);
+                    if (val.includes('{') && val.includes('}')) {
+                      applyAiText(val);
+                    } else {
+                      setAiFeedback(null);
+                    }
+                  }}
+                  placeholder='Pega aquí la respuesta de tu IA (ej. {"fecha": "2026-10-14", ...})'
+                  className="w-full px-3 py-2 text-xs font-mono text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-600"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    disabled={!aiResponseInput.trim()}
+                    onClick={() => applyAiText(aiResponseInput)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-40 rounded-md transition-colors cursor-pointer"
+                  >
+                    <ClipboardCheck className="w-3.5 h-3.5" />
+                    Aplicar respuesta
+                  </button>
+                  {aiFeedback && (
+                    <span
+                      className={`text-[11px] font-medium ${
+                        aiFeedback.type === 'success'
+                          ? 'text-emerald-700'
+                          : 'text-red-700'
+                      }`}
+                    >
+                      {aiFeedback.text}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
             {item.rawOcrText && (
-              <details className="pt-3 border-t border-slate-100">
+              <details className="pt-2 border-t border-slate-100">
                 <summary className="text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer select-none">
-                  Ver texto leído del documento (
+                  Ver texto leído por OCR (
                   {item.extractionMethod === 'pdf-text'
                     ? 'Texto PDF'
                     : item.extractionMethod === 'text'
