@@ -108,15 +108,16 @@ async function runExtractionWithModel(
   model: string,
   parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
 ) {
-  const isGemini4 = model.startsWith('gemini-4');
-  const isGemini25 = model.startsWith('gemini-2.5');
+  const supportsThinkingLevel =
+    model.startsWith('gemini-4') || model.startsWith('gemini-3');
   return ai.models.generateContent({
     model,
     contents: { parts },
     config: {
       systemInstruction: EXTRACTION_SYSTEM_INSTRUCTION,
-      ...(isGemini4 ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
-      ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+      ...(supportsThinkingLevel
+        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+        : {}),
       responseMimeType: 'application/json',
       responseSchema: {
         type: Type.OBJECT,
@@ -201,7 +202,7 @@ export async function extractInvoiceData(
         },
       ];
 
-  const defaultModel = process.env.VERCEL ? 'gemini-2.5-flash' : 'gemini-4-hydrogen';
+  const defaultModel = process.env.VERCEL ? 'gemini-3.8-flash' : 'gemini-4-hydrogen';
   const primaryModel = process.env.GEMINI_MODEL || defaultModel;
   let response;
   try {
@@ -210,9 +211,9 @@ export async function extractInvoiceData(
     const apiErr = err as { status?: number; message?: string };
     const isNotFound =
       apiErr?.status === 404 ||
-      (typeof apiErr?.message === 'string' && apiErr.message.includes('not found'));
-    if (isNotFound && primaryModel === 'gemini-4-hydrogen') {
-      response = await runExtractionWithModel(ai, 'gemini-2.5-flash', parts);
+      (typeof apiErr?.message === 'string' && apiErr.message.includes('NOT_FOUND'));
+    if (isNotFound && primaryModel !== 'gemini-3.8-flash') {
+      response = await runExtractionWithModel(ai, 'gemini-3.8-flash', parts);
     } else {
       throw err;
     }
