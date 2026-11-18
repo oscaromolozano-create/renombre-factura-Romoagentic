@@ -54,8 +54,8 @@ async function prepareExtractionPayload(
   file: File,
   mimeType: string
 ): Promise<{ mimeType: string; base64Data: string }> {
-  const TWO_MB = 2 * 1024 * 1024;
-  if (mimeType.startsWith('image/') && file.size > TWO_MB) {
+  const HALF_MB = 500 * 1024;
+  if (mimeType.startsWith('image/') && file.size > HALF_MB) {
     try {
       const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -69,7 +69,7 @@ async function prepareExtractionPayload(
         image.onerror = () => reject(new Error('No se pudo decodificar la imagen.'));
         image.src = dataUrl;
       });
-      const maxDim = 1800;
+      const maxDim = 1400;
       const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(img.width * scale);
@@ -310,6 +310,11 @@ export default function App() {
           if (response.status === 401) {
             setAccessState('locked');
             throw new Error('Acceso no autorizado. Introduce el código de acceso.');
+          }
+          if (response.status === 504) {
+            throw new Error(
+              'El análisis tardó más de lo esperado (504). Pulsa reintentar en esta factura.'
+            );
           }
           if (response.status === 413) {
             throw new Error(

@@ -109,12 +109,14 @@ async function runExtractionWithModel(
   parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
 ) {
   const isGemini4 = model.startsWith('gemini-4');
+  const isGemini25 = model.startsWith('gemini-2.5');
   return ai.models.generateContent({
     model,
     contents: { parts },
     config: {
       systemInstruction: EXTRACTION_SYSTEM_INSTRUCTION,
       ...(isGemini4 ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
+      ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
       responseMimeType: 'application/json',
       responseSchema: {
         type: Type.OBJECT,
@@ -199,7 +201,8 @@ export async function extractInvoiceData(
         },
       ];
 
-  const primaryModel = process.env.GEMINI_MODEL || 'gemini-4-hydrogen';
+  const defaultModel = process.env.VERCEL ? 'gemini-2.5-flash' : 'gemini-4-hydrogen';
+  const primaryModel = process.env.GEMINI_MODEL || defaultModel;
   let response;
   try {
     response = await runExtractionWithModel(ai, primaryModel, parts);
