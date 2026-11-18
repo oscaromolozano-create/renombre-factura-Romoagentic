@@ -94,7 +94,7 @@ export const InvoiceDropzone: React.FC<InvoiceDropzoneProps> = ({
                 : 'Arrastra tus facturas aquí o selecciónalas desde tu ordenador'}
             </h3>
             <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-              Admite PDF, fotos del móvil (PNG, JPG, WEBP) o XML · Lectura automática en segundos
+              Admite PDF, fotos del móvil (PNG, JPG, WEBP) o XML · Lectura automática por OCR en tu navegador
             </p>
           </div>
         </div>

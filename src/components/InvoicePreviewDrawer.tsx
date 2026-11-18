@@ -220,6 +220,23 @@ export const InvoicePreviewDrawer: React.FC<InvoicePreviewDrawerProps> = ({
                 {renamedFilename}
               </div>
             </div>
+
+            {item.rawOcrText && (
+              <details className="pt-3 border-t border-slate-100">
+                <summary className="text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer select-none">
+                  Ver texto leído del documento (
+                  {item.extractionMethod === 'pdf-text'
+                    ? 'Texto PDF'
+                    : item.extractionMethod === 'text'
+                    ? 'Archivo texto'
+                    : 'OCR'}
+                  )
+                </summary>
+                <pre className="mt-2 p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-mono text-slate-600 whitespace-pre-wrap max-h-48 overflow-y-auto">
+                  {item.rawOcrText}
+                </pre>
+              </details>
+            )}
           </div>
         </div>
       </div>
