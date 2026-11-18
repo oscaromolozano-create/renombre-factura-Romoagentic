@@ -54,8 +54,6 @@ export interface InvoiceItem {
   sizeBytes: number;
   status: ExtractionStatus;
   errorMessage?: string;
-  extractionMethod?: 'pdf-text' | 'ocr' | 'text';
-  rawOcrText?: string;
   data: ExtractedInvoiceData;
   selected: boolean;
 }

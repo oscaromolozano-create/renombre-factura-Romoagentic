@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
-import { Upload } from 'lucide-react';
+import { Lock, Upload } from 'lucide-react';
 import { FormatConfigurator } from './components/FormatConfigurator';
 import { InvoiceDropzone } from './components/InvoiceDropzone';
 import { InvoicePreviewDrawer } from './components/InvoicePreviewDrawer';
@@ -16,11 +16,11 @@ import {
   computeBatchFilenames,
   extractExtension,
 } from './utils/renameEngine';
-import { extractInvoiceLocally } from './utils/ocrEngine';
 import { createSampleInvoiceFiles } from './utils/sampleInvoices';
 
 const STORAGE_CONFIG_KEY = 'folioclaro_config_v1';
 const STORAGE_TEMPLATES_KEY = 'folioclaro_templates_v1';
+const SESSION_ACCESS_CODE_KEY = 'folioclaro_access_code_v1';
 
 const EMPTY_EXTRACTED_DATA: ExtractedInvoiceData = {
   invoiceDate: '',
@@ -33,6 +33,67 @@ const EMPTY_EXTRACTED_DATA: ExtractedInvoiceData = {
   confidence: 'medium',
 };
 
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== 'string') {
+        reject(new Error('No se pudo leer el contenido del archivo.'));
+        return;
+      }
+      const commaIdx = result.indexOf(',');
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = () => reject(new Error('Error leyendo el archivo local.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function prepareExtractionPayload(
+  file: File,
+  mimeType: string
+): Promise<{ mimeType: string; base64Data: string }> {
+  const TWO_MB = 2 * 1024 * 1024;
+  if (mimeType.startsWith('image/') && file.size > TWO_MB) {
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('No se pudo leer la imagen.'));
+        reader.readAsDataURL(file);
+      });
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error('No se pudo decodificar la imagen.'));
+        image.src = dataUrl;
+      });
+      const maxDim = 1800;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const commaIdx = compressedDataUrl.indexOf(',');
+        return {
+          mimeType: 'image/jpeg',
+          base64Data: commaIdx >= 0 ? compressedDataUrl.slice(commaIdx + 1) : compressedDataUrl,
+        };
+      }
+    } catch {
+      // Fallback to original file if canvas optimization fails
+    }
+  }
+
+  const base64Data = await readFileAsBase64(file);
+  return { mimeType, base64Data };
+}
 
 function inferMimeType(file: File): string {
   if (file.type) return file.type;
@@ -93,6 +154,18 @@ export default function App() {
     return [];
   });
 
+  const [accessState, setAccessState] = useState<'checking' | 'locked' | 'unlocked'>('checking');
+  const [accessCode, setAccessCode] = useState<string>(() => {
+    try {
+      return sessionStorage.getItem(SESSION_ACCESS_CODE_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [accessInput, setAccessInput] = useState('');
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [isVerifyingAccess, setIsVerifyingAccess] = useState(false);
+
   const [items, setItems] = useState<InvoiceItem[]>([]);
   const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [isZipping, setIsZipping] = useState(false);
@@ -102,6 +175,42 @@ export default function App() {
   const headerFileInputRef = useRef<HTMLInputElement | null>(null);
   const activeWorkersRef = useRef(0);
   const queueRef = useRef<InvoiceItem[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    const checkAccess = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (!res.ok) {
+          if (active) setAccessState('unlocked');
+          return;
+        }
+        const info = (await res.json()) as { requiresAccessCode?: boolean };
+        if (!info.requiresAccessCode) {
+          if (active) setAccessState('unlocked');
+          return;
+        }
+        if (accessCode) {
+          const verifyRes = await fetch('/api/verify-access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: accessCode }),
+          });
+          if (verifyRes.ok) {
+            if (active) setAccessState('unlocked');
+            return;
+          }
+        }
+        if (active) setAccessState('locked');
+      } catch {
+        if (active) setAccessState('unlocked');
+      }
+    };
+    checkAccess();
+    return () => {
+      active = false;
+    };
+  }, [accessCode]);
 
   useEffect(() => {
     try {
@@ -129,58 +238,154 @@ export default function App() {
     [items, inspectedId]
   );
 
-  const processSingleInvoice = useCallback(async (item: InvoiceItem) => {
-    setItems((prev) =>
-      prev.map((row) =>
-        row.id === item.id
-          ? { ...row, status: 'extracting', errorMessage: undefined }
-          : row
-      )
-    );
+  const handleUnlockSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const candidate = accessInput.trim();
+    if (!candidate) return;
 
+    setIsVerifyingAccess(true);
+    setAccessError(null);
     try {
-      const result = await extractInvoiceLocally(item.file, item.mimeType);
-      const extracted = result.data;
-
-      const hasCoreFields =
-        Boolean(extracted.invoiceDate) &&
-        Boolean(extracted.invoiceNumber) &&
-        Boolean(extracted.supplier);
-
-      setItems((prev) =>
-        prev.map((row) =>
-          row.id === item.id
-            ? {
-                ...row,
-                status: hasCoreFields ? 'ready' : 'review',
-                extractionMethod: result.method,
-                rawOcrText: result.rawText,
-                data: extracted,
-              }
-            : row
-        )
-      );
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : 'No se pudo procesar esta factura con OCR.';
-      setItems((prev) =>
-        prev.map((row) =>
-          row.id === item.id
-            ? {
-                ...row,
-                status: 'error',
-                errorMessage: message,
-              }
-            : row
-        )
-      );
+      const res = await fetch('/api/verify-access', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: candidate }),
+      });
+      if (!res.ok) {
+        setAccessError('Código de acceso incorrecto.');
+        return;
+      }
+      try {
+        sessionStorage.setItem(SESSION_ACCESS_CODE_KEY, candidate);
+      } catch {
+        // ignore storage restrictions
+      }
+      setAccessCode(candidate);
+      setAccessState('unlocked');
+    } catch {
+      setAccessError('No se pudo verificar el código. Inténtalo de nuevo.');
+    } finally {
+      setIsVerifyingAccess(false);
     }
-  }, []);
+  };
+
+  const processSingleInvoice = useCallback(
+    async (item: InvoiceItem) => {
+      setItems((prev) =>
+        prev.map((row) =>
+          row.id === item.id
+            ? { ...row, status: 'extracting', errorMessage: undefined }
+            : row
+        )
+      );
+
+      try {
+        const prepared = await prepareExtractionPayload(item.file, item.mimeType);
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (accessCode) {
+          headers['x-access-code'] = accessCode;
+        }
+
+        const response = await fetch('/api/extract-invoice', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            fileName: item.originalName,
+            mimeType: prepared.mimeType,
+            base64Data: prepared.base64Data,
+          }),
+        });
+
+        const rawBody = await response.text();
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+        } catch {
+          payload = {};
+        }
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            setAccessState('locked');
+            throw new Error('Acceso no autorizado. Introduce el código de acceso.');
+          }
+          if (response.status === 413) {
+            throw new Error(
+              'El archivo supera el límite de 4,5 MB permitido por el servidor. Reduce el peso del PDF o sube una imagen.'
+            );
+          }
+          if (response.status === 404) {
+            throw new Error(
+              'No se encontró la función /api/extract-invoice en el servidor.'
+            );
+          }
+          const serverError =
+            typeof payload.error === 'string' && payload.error
+              ? payload.error
+              : `Error del servidor (${response.status}) al analizar la factura.`;
+          throw new Error(serverError);
+        }
+
+        const str = (key: string, fallback = '') =>
+          typeof payload[key] === 'string' ? (payload[key] as string) : fallback;
+        const rawConf = payload.confidence;
+        const confidence: ExtractedInvoiceData['confidence'] =
+          rawConf === 'high' || rawConf === 'medium' || rawConf === 'low'
+            ? rawConf
+            : 'medium';
+
+        const extracted: ExtractedInvoiceData = {
+          invoiceDate: str('invoiceDate'),
+          invoiceNumber: str('invoiceNumber'),
+          supplier: str('supplier'),
+          supplierTaxId: str('supplierTaxId'),
+          totalAmount: str('totalAmount'),
+          currency: str('currency', 'EUR'),
+          concept: str('concept'),
+          confidence,
+        };
+
+        const hasCoreFields =
+          Boolean(extracted.invoiceDate) &&
+          Boolean(extracted.invoiceNumber) &&
+          Boolean(extracted.supplier);
+
+        setItems((prev) =>
+          prev.map((row) =>
+            row.id === item.id
+              ? {
+                  ...row,
+                  status: hasCoreFields && extracted.confidence !== 'low' ? 'ready' : 'review',
+                  data: extracted,
+                }
+              : row
+          )
+        );
+      } catch (error: unknown) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'No se pudo procesar esta factura.';
+        setItems((prev) =>
+          prev.map((row) =>
+            row.id === item.id
+              ? {
+                  ...row,
+                  status: 'error',
+                  errorMessage: message,
+                }
+              : row
+          )
+        );
+      }
+    },
+    [accessCode]
+  );
 
   const pumpQueue = useCallback(() => {
-    const MAX_CONCURRENCY = 1;
+    const MAX_CONCURRENCY = 3;
     while (activeWorkersRef.current < MAX_CONCURRENCY && queueRef.current.length > 0) {
       const nextItem = queueRef.current.shift();
       if (!nextItem) break;
@@ -249,37 +454,6 @@ export default function App() {
           ...item,
           data: updatedData,
           status: hasCoreFields ? 'ready' : 'review',
-        };
-      })
-    );
-  };
-
-  const handleApplyParsedData = (
-    id: string,
-    parsed: Partial<ExtractedInvoiceData>
-  ) => {
-    setItems((prev) =>
-      prev.map((item) => {
-        if (item.id !== id) return item;
-        const updatedData: ExtractedInvoiceData = {
-          ...item.data,
-          invoiceDate: parsed.invoiceDate || item.data.invoiceDate,
-          invoiceNumber: parsed.invoiceNumber || item.data.invoiceNumber,
-          supplier: parsed.supplier || item.data.supplier,
-          supplierTaxId: parsed.supplierTaxId || item.data.supplierTaxId,
-          totalAmount: parsed.totalAmount || item.data.totalAmount,
-          concept: parsed.concept || item.data.concept,
-          confidence: 'high',
-        };
-        const hasCoreFields =
-          Boolean(updatedData.invoiceDate) &&
-          Boolean(updatedData.invoiceNumber) &&
-          Boolean(updatedData.supplier);
-        return {
-          ...item,
-          data: updatedData,
-          status: hasCoreFields ? 'ready' : 'review',
-          errorMessage: undefined,
         };
       })
     );
@@ -397,6 +571,46 @@ export default function App() {
   const handleApplyTemplate = (template: SavedClientTemplate) => {
     setConfig({ ...template.config });
   };
+
+  if (accessState === 'locked') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-5">
+          <div className="w-11 h-11 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-800">
+            <Lock className="w-5 h-5" />
+          </div>
+          <div>
+            <h1 className="font-display text-xl font-bold text-slate-900">
+              Acceso privado a FolioClaro
+            </h1>
+            <p className="text-sm text-slate-600 mt-1">
+              Introduce el código de acceso de la empresa para leer y renombrar facturas.
+            </p>
+          </div>
+          <form onSubmit={handleUnlockSubmit} className="space-y-3">
+            <input
+              type="password"
+              value={accessInput}
+              onChange={(e) => setAccessInput(e.target.value)}
+              placeholder="Código de acceso"
+              autoFocus
+              className="w-full px-3.5 py-2.5 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-600"
+            />
+            {accessError && (
+              <p className="text-xs font-medium text-red-700">{accessError}</p>
+            )}
+            <button
+              type="submit"
+              disabled={isVerifyingAccess || !accessInput.trim()}
+              className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+            >
+              {isVerifyingAccess ? 'Verificando...' : 'Entrar'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
@@ -550,11 +764,11 @@ export default function App() {
           </div>
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
-              03. Revisa o apóyate en tu IA y descarga en ZIP
+              03. Descarga todo listo para archivar
             </h2>
             <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-              Si alguna foto difícil queda en Revisar, ábrela para copiar la instrucción a tu
-              ChatGPT, Claude o Gemini sin API y descarga todo renombrado en un ZIP y Excel CSV.
+              Revisa o ajusta cualquier campo al instante y descarga todas las facturas ya
+              renombradas en un único archivo ZIP junto con su registro en Excel CSV.
             </p>
           </div>
         </section>
@@ -562,8 +776,8 @@ export default function App() {
 
       <footer className="bg-white border-t border-slate-200 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <span>FolioClaro · Organización automática de facturas por OCR local</span>
-          <span>Compatible con PDF, PNG, JPG, WEBP y XML · Sin claves de API</span>
+          <span>FolioClaro · Organización automática de facturas para empresas</span>
+          <span>Compatible con PDF, PNG, JPG, WEBP y XML</span>
         </div>
       </footer>
 
@@ -575,7 +789,6 @@ export default function App() {
         }
         onClose={() => setInspectedId(null)}
         onUpdateField={handleUpdateField}
-        onApplyParsedData={handleApplyParsedData}
         onRetry={handleRetryItem}
         onDownload={handleDownloadSingle}
       />
