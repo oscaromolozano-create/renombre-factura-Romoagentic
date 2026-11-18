@@ -288,15 +288,32 @@ export default function App() {
           headers['x-access-code'] = accessCode;
         }
 
-        const response = await fetch('/api/extract-invoice', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            fileName: item.originalName,
-            mimeType: prepared.mimeType,
-            base64Data: prepared.base64Data,
-          }),
-        });
+        const fetchWithRetry = async () => {
+          const res = await fetch('/api/extract-invoice', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              fileName: item.originalName,
+              mimeType: prepared.mimeType,
+              base64Data: prepared.base64Data,
+            }),
+          });
+          if (res.status === 503 || res.status === 504) {
+            await new Promise((r) => setTimeout(r, 1500));
+            return fetch('/api/extract-invoice', {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                fileName: item.originalName,
+                mimeType: prepared.mimeType,
+                base64Data: prepared.base64Data,
+              }),
+            });
+          }
+          return res;
+        };
+
+        const response = await fetchWithRetry();
 
         const rawBody = await response.text();
         let payload: Record<string, unknown> = {};
@@ -390,7 +407,7 @@ export default function App() {
   );
 
   const pumpQueue = useCallback(() => {
-    const MAX_CONCURRENCY = 3;
+    const MAX_CONCURRENCY = 2;
     while (activeWorkersRef.current < MAX_CONCURRENCY && queueRef.current.length > 0) {
       const nextItem = queueRef.current.shift();
       if (!nextItem) break;

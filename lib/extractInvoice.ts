@@ -108,6 +108,7 @@ async function runExtractionWithModel(
   model: string,
   parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>
 ) {
+  const isLite = model.includes('flash-lite');
   const supportsThinkingLevel =
     model.startsWith('gemini-4') || model.startsWith('gemini-3');
   return ai.models.generateContent({
@@ -116,7 +117,11 @@ async function runExtractionWithModel(
     config: {
       systemInstruction: EXTRACTION_SYSTEM_INSTRUCTION,
       ...(supportsThinkingLevel
-        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+        ? {
+            thinkingConfig: {
+              thinkingLevel: isLite ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+            },
+          }
         : {}),
       responseMimeType: 'application/json',
       responseSchema: {
@@ -170,6 +175,18 @@ async function runExtractionWithModel(
   });
 }
 
+function isErrorStatus(err: unknown, code: number, keyword: string): boolean {
+  const apiErr = err as { status?: number; message?: string };
+  return (
+    apiErr?.status === code ||
+    (typeof apiErr?.message === 'string' && apiErr.message.includes(keyword))
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function extractInvoiceData(
   input: ExtractInvoiceInput
 ): Promise<ExtractInvoiceResult> {
@@ -204,19 +221,36 @@ export async function extractInvoiceData(
 
   const defaultModel = process.env.VERCEL ? 'gemini-3.8-flash' : 'gemini-4-hydrogen';
   const primaryModel = process.env.GEMINI_MODEL || defaultModel;
+  const fallbackChain =
+    primaryModel === 'gemini-3.8-flash'
+      ? ['gemini-3.8-flash', 'gemini-3.1-flash-lite']
+      : [primaryModel, 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+
   let response;
-  try {
-    response = await runExtractionWithModel(ai, primaryModel, parts);
-  } catch (err: unknown) {
-    const apiErr = err as { status?: number; message?: string };
-    const isNotFound =
-      apiErr?.status === 404 ||
-      (typeof apiErr?.message === 'string' && apiErr.message.includes('NOT_FOUND'));
-    if (isNotFound && primaryModel !== 'gemini-3.8-flash') {
-      response = await runExtractionWithModel(ai, 'gemini-3.8-flash', parts);
-    } else {
+  let lastError: unknown;
+
+  for (let i = 0; i < fallbackChain.length; i += 1) {
+    const modelName = fallbackChain[i];
+    try {
+      response = await runExtractionWithModel(ai, modelName, parts);
+      lastError = undefined;
+      break;
+    } catch (err: unknown) {
+      lastError = err;
+      const isNotFound = isErrorStatus(err, 404, 'NOT_FOUND');
+      const isUnavailable = isErrorStatus(err, 503, 'UNAVAILABLE');
+      if ((isNotFound || isUnavailable) && i < fallbackChain.length - 1) {
+        if (isUnavailable) {
+          await sleep(700);
+        }
+        continue;
+      }
       throw err;
     }
+  }
+
+  if (!response) {
+    throw lastError || new Error('No se obtuvo respuesta del modelo.');
   }
 
   const rawText = (response.text ?? '{}').trim();
@@ -261,6 +295,17 @@ export function mapExtractionError(error: unknown): { status: number; message: s
       status: 429,
       message:
         'Se alcanzó el límite gratuito temporal por minuto. Espera unos segundos e inténtalo de nuevo.',
+    };
+  }
+
+  if (
+    status === 503 ||
+    (typeof err.message === 'string' && err.message.includes('UNAVAILABLE'))
+  ) {
+    return {
+      status: 503,
+      message:
+        'Los servidores de Google están saturados en este momento (503). Pulsa reintentar en unos segundos.',
     };
   }
 
