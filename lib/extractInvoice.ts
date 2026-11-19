@@ -30,7 +30,7 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 30;
+const RATE_LIMIT_MAX_REQUESTS = 80;
 const ipHits = new Map<string, number[]>();
 
 export function checkRateLimit(ip: string): boolean {
@@ -219,12 +219,12 @@ export async function extractInvoiceData(
         },
       ];
 
-  const defaultModel = process.env.VERCEL ? 'gemini-3.8-flash' : 'gemini-4-hydrogen';
+  const defaultModel = process.env.VERCEL ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
   const primaryModel = process.env.GEMINI_MODEL || defaultModel;
   const fallbackChain =
-    primaryModel === 'gemini-3.8-flash'
-      ? ['gemini-3.8-flash', 'gemini-3.1-flash-lite']
-      : [primaryModel, 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+    primaryModel === 'gemini-3.1-flash-lite'
+      ? ['gemini-3.1-flash-lite', 'gemini-3.8-flash']
+      : [primaryModel, 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
 
   let response;
   let lastError: unknown;
@@ -239,9 +239,10 @@ export async function extractInvoiceData(
       lastError = err;
       const isNotFound = isErrorStatus(err, 404, 'NOT_FOUND');
       const isUnavailable = isErrorStatus(err, 503, 'UNAVAILABLE');
-      if ((isNotFound || isUnavailable) && i < fallbackChain.length - 1) {
-        if (isUnavailable) {
-          await sleep(700);
+      const isRateLimited = isErrorStatus(err, 429, 'RESOURCE_EXHAUSTED');
+      if ((isNotFound || isUnavailable || isRateLimited) && i < fallbackChain.length - 1) {
+        if (isUnavailable || isRateLimited) {
+          await sleep(450);
         }
         continue;
       }

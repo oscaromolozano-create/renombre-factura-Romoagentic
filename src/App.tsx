@@ -16,6 +16,7 @@ import {
   computeBatchFilenames,
   extractExtension,
 } from './utils/renameEngine';
+import { prepareFastExtractionPayload } from './utils/pdfOptimizer';
 import { createSampleInvoiceFiles } from './utils/sampleInvoices';
 
 const STORAGE_CONFIG_KEY = 'folioclaro_config_v1';
@@ -33,67 +34,6 @@ const EMPTY_EXTRACTED_DATA: ExtractedInvoiceData = {
   confidence: 'medium',
 };
 
-function readFileAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result !== 'string') {
-        reject(new Error('No se pudo leer el contenido del archivo.'));
-        return;
-      }
-      const commaIdx = result.indexOf(',');
-      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
-    };
-    reader.onerror = () => reject(new Error('Error leyendo el archivo local.'));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function prepareExtractionPayload(
-  file: File,
-  mimeType: string
-): Promise<{ mimeType: string; base64Data: string }> {
-  const HALF_MB = 500 * 1024;
-  if (mimeType.startsWith('image/') && file.size > HALF_MB) {
-    try {
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error('No se pudo leer la imagen.'));
-        reader.readAsDataURL(file);
-      });
-      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-        const image = new Image();
-        image.onload = () => resolve(image);
-        image.onerror = () => reject(new Error('No se pudo decodificar la imagen.'));
-        image.src = dataUrl;
-      });
-      const maxDim = 1400;
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-        const commaIdx = compressedDataUrl.indexOf(',');
-        return {
-          mimeType: 'image/jpeg',
-          base64Data: commaIdx >= 0 ? compressedDataUrl.slice(commaIdx + 1) : compressedDataUrl,
-        };
-      }
-    } catch {
-      // Fallback to original file if canvas optimization fails
-    }
-  }
-
-  const base64Data = await readFileAsBase64(file);
-  return { mimeType, base64Data };
-}
 
 function inferMimeType(file: File): string {
   if (file.type) return file.type;
@@ -280,7 +220,7 @@ export default function App() {
       );
 
       try {
-        const prepared = await prepareExtractionPayload(item.file, item.mimeType);
+        const prepared = await prepareFastExtractionPayload(item.file, item.mimeType);
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
         };
@@ -289,7 +229,8 @@ export default function App() {
         }
 
         const fetchWithRetry = async () => {
-          const res = await fetch('/api/extract-invoice', {
+          const delays = [1000, 2200];
+          let res = await fetch('/api/extract-invoice', {
             method: 'POST',
             headers,
             body: JSON.stringify({
@@ -298,9 +239,13 @@ export default function App() {
               base64Data: prepared.base64Data,
             }),
           });
-          if (res.status === 503 || res.status === 504) {
-            await new Promise((r) => setTimeout(r, 1500));
-            return fetch('/api/extract-invoice', {
+
+          for (const delay of delays) {
+            if (res.status !== 429 && res.status !== 503 && res.status !== 504) {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, delay));
+            res = await fetch('/api/extract-invoice', {
               method: 'POST',
               headers,
               body: JSON.stringify({
@@ -407,7 +352,7 @@ export default function App() {
   );
 
   const pumpQueue = useCallback(() => {
-    const MAX_CONCURRENCY = 2;
+    const MAX_CONCURRENCY = 3;
     while (activeWorkersRef.current < MAX_CONCURRENCY && queueRef.current.length > 0) {
       const nextItem = queueRef.current.shift();
       if (!nextItem) break;
