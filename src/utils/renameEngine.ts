@@ -78,12 +78,29 @@ export function sanitizeSegment(
 }
 
 export function formatInvoiceDate(isoDate: string, format: DateFormatOption): string {
-  const match = isoDate.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!match) {
-    return isoDate.trim().replace(/[/\\:*?"<>|]/g, '-');
+  const trimmed = isoDate.trim();
+  let year = '';
+  let month = '';
+  let day = '';
+
+  const isoMatch = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (isoMatch) {
+    year = isoMatch[1];
+    month = isoMatch[2].padStart(2, '0');
+    day = isoMatch[3].padStart(2, '0');
+  } else {
+    const euMatch = trimmed.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+    if (euMatch) {
+      day = euMatch[1].padStart(2, '0');
+      month = euMatch[2].padStart(2, '0');
+      year = euMatch[3];
+    }
   }
 
-  const [, year, month, day] = match;
+  if (!year || !month || !day) {
+    return trimmed.replace(/[/\\:*?"<>|]/g, '-');
+  }
+
   switch (format) {
     case 'YYYY-MM-DD':
       return `${year}-${month}-${day}`;

@@ -5,6 +5,7 @@ export interface ExtractInvoiceInput {
   fileName?: string;
   mimeType: string;
   base64Data: string;
+  extractedText?: string;
 }
 
 export interface ExtractInvoiceResult {
@@ -30,7 +31,7 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 80;
+const RATE_LIMIT_MAX_REQUESTS = 150;
 const ipHits = new Map<string, number[]>();
 
 export function checkRateLimit(ip: string): boolean {
@@ -46,15 +47,29 @@ export function checkRateLimit(ip: string): boolean {
   return true;
 }
 
+function normalizeHost(host: string): string {
+  return host.trim().toLowerCase().replace(/^www\./, '');
+}
+
 export function isAllowedOrigin(
   originHeader: string | undefined,
-  hostHeader: string | undefined
+  hostHeader: string | undefined,
+  forwardedHostHeader?: string | undefined
 ): boolean {
   if (!originHeader) return true;
-  if (!hostHeader) return false;
   try {
-    const originHost = new URL(originHeader).host;
-    return originHost === hostHeader;
+    const originHost = normalizeHost(new URL(originHeader).host);
+    const candidates = [
+      hostHeader,
+      forwardedHostHeader,
+      process.env.VERCEL_URL,
+      process.env.VERCEL_BRANCH_URL,
+      process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    ]
+      .filter((h): h is string => Boolean(h))
+      .flatMap((h) => h.split(',').map(normalizeHost));
+    if (candidates.length === 0) return true;
+    return candidates.some((c) => c === originHost);
   } catch {
     return false;
   }
@@ -175,12 +190,61 @@ async function runExtractionWithModel(
   });
 }
 
+function extractErrorCode(err: unknown): number | undefined {
+  const apiErr = err as {
+    status?: number;
+    code?: number;
+    error?: { code?: number };
+    message?: string;
+  };
+  if (typeof apiErr?.status === 'number') return apiErr.status;
+  if (typeof apiErr?.code === 'number') return apiErr.code;
+  if (typeof apiErr?.error?.code === 'number') return apiErr.error.code;
+  if (typeof apiErr?.message === 'string') {
+    const m = apiErr.message.match(/"code"\s*:\s*(\d{3})/);
+    if (m) return Number(m[1]);
+  }
+  return undefined;
+}
+
 function isErrorStatus(err: unknown, code: number, keyword: string): boolean {
-  const apiErr = err as { status?: number; message?: string };
+  const apiErr = err as { message?: string };
+  const detectedCode = extractErrorCode(err);
   return (
-    apiErr?.status === code ||
+    detectedCode === code ||
     (typeof apiErr?.message === 'string' && apiErr.message.includes(keyword))
   );
+}
+
+function extractRetryDelaySeconds(err: unknown): number | undefined {
+  const apiErr = err as { message?: string };
+  const msg = typeof apiErr?.message === 'string' ? apiErr.message : '';
+  if (!msg) return undefined;
+
+  const retryInMatch = msg.match(/retry\s+in\s+(\d+(?:\.\d+)?)s/i);
+  if (retryInMatch) {
+    return Math.min(65, Math.max(5, Math.ceil(Number(retryInMatch[1]))));
+  }
+
+  const retryDelayMatch = msg.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+  if (retryDelayMatch) {
+    return Math.min(65, Math.max(5, Number(retryDelayMatch[1])));
+  }
+
+  return undefined;
+}
+
+function normalizeIsoDateString(raw: string): string {
+  const trimmed = raw.trim();
+  const isoMatch = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+  }
+  const euMatch = trimmed.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+  if (euMatch) {
+    return `${euMatch[3]}-${euMatch[2].padStart(2, '0')}-${euMatch[1].padStart(2, '0')}`;
+  }
+  return trimmed;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -191,12 +255,17 @@ export async function extractInvoiceData(
   input: ExtractInvoiceInput
 ): Promise<ExtractInvoiceResult> {
   const ai = getGeminiClient();
-  const { fileName, mimeType, base64Data } = input;
+  const { fileName, mimeType, base64Data, extractedText } = input;
 
   const isTextDocument =
     mimeType.startsWith('text/') ||
     mimeType === 'application/xml' ||
     mimeType === 'text/xml';
+
+  const cleanTextHint =
+    typeof extractedText === 'string' && extractedText.trim()
+      ? `\n\nTexto extraído del PDF (útil para no confundir caracteres ni números):\n${extractedText.trim().slice(0, 8000)}`
+      : '';
 
   const parts = isTextDocument
     ? [
@@ -215,16 +284,19 @@ export async function extractInvoiceData(
           },
         },
         {
-          text: `Analiza esta factura (archivo original: "${fileName || 'factura'}") y extrae exactamente los campos solicitados en JSON.`,
+          text: `Analiza esta factura (archivo original: "${fileName || 'factura'}") y extrae exactamente los campos solicitados en JSON.${cleanTextHint}`,
         },
       ];
 
   const defaultModel = process.env.VERCEL ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
   const primaryModel = process.env.GEMINI_MODEL || defaultModel;
-  const fallbackChain =
-    primaryModel === 'gemini-3.1-flash-lite'
-      ? ['gemini-3.1-flash-lite', 'gemini-3.8-flash']
-      : [primaryModel, 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+  const fallbackChain = Array.from(
+    new Set(
+      process.env.VERCEL
+        ? [primaryModel, 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-4-hydrogen']
+        : [primaryModel, 'gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash']
+    )
+  );
 
   let response;
   let lastError: unknown;
@@ -237,12 +309,16 @@ export async function extractInvoiceData(
       break;
     } catch (err: unknown) {
       lastError = err;
+      const isForbidden = isErrorStatus(err, 403, 'PERMISSION_DENIED');
       const isNotFound = isErrorStatus(err, 404, 'NOT_FOUND');
       const isUnavailable = isErrorStatus(err, 503, 'UNAVAILABLE');
       const isRateLimited = isErrorStatus(err, 429, 'RESOURCE_EXHAUSTED');
-      if ((isNotFound || isUnavailable || isRateLimited) && i < fallbackChain.length - 1) {
-        if (isUnavailable || isRateLimited) {
-          await sleep(450);
+      if (
+        (isForbidden || isNotFound || isUnavailable || isRateLimited) &&
+        i < fallbackChain.length - 1
+      ) {
+        if (isUnavailable) {
+          await sleep(400);
         }
         continue;
       }
@@ -258,7 +334,10 @@ export async function extractInvoiceData(
   const parsed = JSON.parse(rawText);
 
   return {
-    invoiceDate: typeof parsed.invoiceDate === 'string' ? parsed.invoiceDate.trim() : '',
+    invoiceDate:
+      typeof parsed.invoiceDate === 'string'
+        ? normalizeIsoDateString(parsed.invoiceDate)
+        : '',
     invoiceNumber: typeof parsed.invoiceNumber === 'string' ? parsed.invoiceNumber.trim() : '',
     supplier: typeof parsed.supplier === 'string' ? parsed.supplier.trim() : '',
     supplierTaxId: typeof parsed.supplierTaxId === 'string' ? parsed.supplierTaxId.trim() : '',
@@ -272,8 +351,12 @@ export async function extractInvoiceData(
   };
 }
 
-export function mapExtractionError(error: unknown): { status: number; message: string } {
-  const err = error as { message?: string; status?: number };
+export function mapExtractionError(error: unknown): {
+  status: number;
+  message: string;
+  retryAfterSeconds?: number;
+} {
+  const err = error as { message?: string };
   if (err.message === 'MISSING_API_KEY') {
     return {
       status: 500,
@@ -282,7 +365,7 @@ export function mapExtractionError(error: unknown): { status: number; message: s
     };
   }
 
-  const status = typeof err.status === 'number' ? err.status : 500;
+  const status = extractErrorCode(error) ?? 500;
   if (status === 403 || status === 400) {
     return {
       status,
@@ -292,10 +375,11 @@ export function mapExtractionError(error: unknown): { status: number; message: s
   }
 
   if (status === 429) {
+    const retryAfterSeconds = extractRetryDelaySeconds(error) ?? 22;
     return {
       status: 429,
-      message:
-        'Se alcanzó el límite gratuito temporal por minuto. Espera unos segundos e inténtalo de nuevo.',
+      retryAfterSeconds,
+      message: `Se alcanzó el límite gratuito temporal por minuto. Espera ${retryAfterSeconds} segundos e inténtalo de nuevo.`,
     };
   }
 
@@ -305,6 +389,7 @@ export function mapExtractionError(error: unknown): { status: number; message: s
   ) {
     return {
       status: 503,
+      retryAfterSeconds: 8,
       message:
         'Los servidores de Google están saturados en este momento (503). Pulsa reintentar en unos segundos.',
     };

@@ -16,7 +16,14 @@ import {
   computeBatchFilenames,
   extractExtension,
 } from './utils/renameEngine';
-import { prepareFastExtractionPayload } from './utils/pdfOptimizer';
+import {
+  extractPdfTextQuickly,
+  prepareFastExtractionPayload,
+} from './utils/pdfOptimizer';
+import {
+  tryBestEffortLocalPdfParse,
+  tryFastLocalPdfParse,
+} from './utils/invoiceTextParser';
 import { createSampleInvoiceFiles } from './utils/sampleInvoices';
 
 const STORAGE_CONFIG_KEY = 'folioclaro_config_v1';
@@ -111,10 +118,14 @@ export default function App() {
   const [isZipping, setIsZipping] = useState(false);
   const [isGeneratingSamples, setIsGeneratingSamples] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [cooldownSeconds, setCooldownSeconds] = useState<number | null>(null);
 
   const headerFileInputRef = useRef<HTMLInputElement | null>(null);
   const activeWorkersRef = useRef(0);
   const queueRef = useRef<InvoiceItem[]>([]);
+  const queueGenerationRef = useRef(0);
+  const safePacingMsRef = useRef(1400);
+  const lastAiRequestAtRef = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -209,8 +220,33 @@ export default function App() {
     }
   };
 
+  const waitWithCooldown = useCallback(
+    async (seconds: number, generation: number, showBanner: boolean): Promise<boolean> => {
+      if (showBanner) {
+        setCooldownSeconds(seconds);
+      }
+      for (let remaining = seconds; remaining > 0; remaining -= 1) {
+        if (queueGenerationRef.current !== generation) {
+          if (showBanner) setCooldownSeconds(null);
+          return false;
+        }
+        if (showBanner) {
+          setCooldownSeconds(remaining);
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (showBanner) {
+        setCooldownSeconds(null);
+      }
+      return queueGenerationRef.current === generation;
+    },
+    []
+  );
+
   const processSingleInvoice = useCallback(
     async (item: InvoiceItem) => {
+      const generation = queueGenerationRef.current;
+
       setItems((prev) =>
         prev.map((row) =>
           row.id === item.id
@@ -219,8 +255,45 @@ export default function App() {
         )
       );
 
+      let preExtractedText = '';
       try {
-        const prepared = await prepareFastExtractionPayload(item.file, item.mimeType);
+        const isPdf =
+          item.mimeType === 'application/pdf' ||
+          item.originalName.toLowerCase().endsWith('.pdf');
+
+        if (isPdf) {
+          try {
+            preExtractedText = await extractPdfTextQuickly(item.file);
+          } catch {
+            preExtractedText = '';
+          }
+
+          // Tier 1: Strictly verified digital PDFs resolve locally in <50ms with 0 AI quota
+          if (preExtractedText) {
+            const fastLocal = tryFastLocalPdfParse(preExtractedText);
+            if (fastLocal) {
+              setItems((prev) =>
+                prev.map((row) =>
+                  row.id === item.id
+                    ? {
+                        ...row,
+                        status: 'ready',
+                        data: fastLocal,
+                      }
+                    : row
+                )
+              );
+              return;
+            }
+          }
+        }
+
+        const prepared = await prepareFastExtractionPayload(
+          item.file,
+          item.mimeType,
+          preExtractedText
+        );
+
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
         };
@@ -228,39 +301,30 @@ export default function App() {
           headers['x-access-code'] = accessCode;
         }
 
-        const fetchWithRetry = async () => {
-          const delays = [1000, 2200];
-          let res = await fetch('/api/extract-invoice', {
+        const sendExtractRequest = async () => {
+          const elapsed = Date.now() - lastAiRequestAtRef.current;
+          const waitBeforeSend = Math.max(0, safePacingMsRef.current - elapsed);
+          if (waitBeforeSend > 0) {
+            await new Promise((r) => setTimeout(r, waitBeforeSend));
+          }
+          if (queueGenerationRef.current !== generation) {
+            throw new Error('Operación cancelada.');
+          }
+          lastAiRequestAtRef.current = Date.now();
+          return fetch('/api/extract-invoice', {
             method: 'POST',
             headers,
             body: JSON.stringify({
               fileName: item.originalName,
               mimeType: prepared.mimeType,
               base64Data: prepared.base64Data,
+              extractedText: prepared.extractedText,
             }),
           });
-
-          for (const delay of delays) {
-            if (res.status !== 429 && res.status !== 503 && res.status !== 504) {
-              break;
-            }
-            await new Promise((r) => setTimeout(r, delay));
-            res = await fetch('/api/extract-invoice', {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({
-                fileName: item.originalName,
-                mimeType: prepared.mimeType,
-                base64Data: prepared.base64Data,
-              }),
-            });
-          }
-          return res;
         };
 
-        const response = await fetchWithRetry();
-
-        const rawBody = await response.text();
+        let response = await sendExtractRequest();
+        let rawBody = await response.text();
         let payload: Record<string, unknown> = {};
         try {
           payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
@@ -268,10 +332,89 @@ export default function App() {
           payload = {};
         }
 
+        // Automatic adaptive cooldown on 429 (free-tier RPM) and 503/504 spikes
+        let rateLimitRetries = 0;
+        let transientRetries = 0;
+        while (!response.ok) {
+          if (response.status === 429 && rateLimitRetries < 2) {
+            rateLimitRetries += 1;
+            safePacingMsRef.current = 4500;
+            const serverSuggested =
+              typeof payload.retryAfterSeconds === 'number' && payload.retryAfterSeconds > 0
+                ? Math.min(60, Math.ceil(payload.retryAfterSeconds))
+                : rateLimitRetries === 1
+                  ? 22
+                  : 38;
+            const shouldContinue = await waitWithCooldown(serverSuggested, generation, true);
+            if (!shouldContinue) return;
+            response = await sendExtractRequest();
+            rawBody = await response.text();
+            try {
+              payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+            } catch {
+              payload = {};
+            }
+            continue;
+          }
+
+          if ((response.status === 503 || response.status === 504) && transientRetries < 2) {
+            transientRetries += 1;
+            const waitSec = transientRetries === 1 ? 4 : 8;
+            const shouldContinue = await waitWithCooldown(waitSec, generation, false);
+            if (!shouldContinue) return;
+            response = await sendExtractRequest();
+            rawBody = await response.text();
+            try {
+              payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+            } catch {
+              payload = {};
+            }
+            continue;
+          }
+
+          break;
+        }
+
+        if (queueGenerationRef.current !== generation) {
+          return;
+        }
+
         if (!response.ok) {
           if (response.status === 401) {
             setAccessState('locked');
             throw new Error('Acceso no autorizado. Introduce el código de acceso.');
+          }
+          // If AI is saturated/blocked and we have digital PDF text, degrade gracefully for manual review
+          const fallbackText = prepared.extractedText || preExtractedText;
+          if (
+            fallbackText &&
+            (response.status === 403 ||
+              response.status === 429 ||
+              response.status === 503 ||
+              response.status === 504)
+          ) {
+            const bestEffort = tryBestEffortLocalPdfParse(fallbackText);
+            if (bestEffort) {
+              setItems((prev) =>
+                prev.map((row) =>
+                  row.id === item.id
+                    ? {
+                        ...row,
+                        status: bestEffort.confidence === 'high' ? 'ready' : 'review',
+                        data: bestEffort,
+                      }
+                    : row
+                )
+              );
+              return;
+            }
+          }
+          if (response.status === 403) {
+            const detail =
+              typeof payload.error === 'string' && payload.error
+                ? payload.error
+                : 'Acceso bloqueado por el servidor (403). Revisa GEMINI_API_KEY o la protección de Vercel.';
+            throw new Error(detail);
           }
           if (response.status === 504) {
             throw new Error(
@@ -331,6 +474,9 @@ export default function App() {
           )
         );
       } catch (error: unknown) {
+        if (queueGenerationRef.current !== generation) {
+          return;
+        }
         const message =
           error instanceof Error
             ? error.message
@@ -348,11 +494,11 @@ export default function App() {
         );
       }
     },
-    [accessCode]
+    [accessCode, waitWithCooldown]
   );
 
   const pumpQueue = useCallback(() => {
-    const MAX_CONCURRENCY = 3;
+    const MAX_CONCURRENCY = 1;
     while (activeWorkersRef.current < MAX_CONCURRENCY && queueRef.current.length > 0) {
       const nextItem = queueRef.current.shift();
       if (!nextItem) break;
@@ -448,6 +594,8 @@ export default function App() {
   };
 
   const handleClearAll = () => {
+    queueGenerationRef.current += 1;
+    setCooldownSeconds(null);
     items.forEach((item) => URL.revokeObjectURL(item.previewUrl));
     queueRef.current = [];
     setItems([]);
@@ -455,7 +603,28 @@ export default function App() {
   };
 
   const handleRetryItem = (item: InvoiceItem) => {
+    setItems((prev) =>
+      prev.map((row) =>
+        row.id === item.id
+          ? { ...row, status: 'queued', errorMessage: undefined }
+          : row
+      )
+    );
     queueRef.current.push(item);
+    pumpQueue();
+  };
+
+  const handleRetryAllFailed = () => {
+    const failedItems = items.filter((i) => i.status === 'error');
+    if (failedItems.length === 0) return;
+    setItems((prev) =>
+      prev.map((row) =>
+        row.status === 'error'
+          ? { ...row, status: 'queued', errorMessage: undefined }
+          : row
+      )
+    );
+    queueRef.current.push(...failedItems);
     pumpQueue();
   };
 
@@ -703,6 +872,8 @@ export default function App() {
           onDownloadAllZip={handleDownloadAllZip}
           onExportCsv={handleExportCsv}
           onClearAll={handleClearAll}
+          onRetryAllFailed={handleRetryAllFailed}
+          cooldownSeconds={cooldownSeconds}
           isZipping={isZipping}
         />
 

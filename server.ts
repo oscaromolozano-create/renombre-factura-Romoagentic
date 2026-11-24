@@ -21,6 +21,7 @@ interface ExtractInvoiceBody {
   fileName?: string;
   mimeType?: string;
   base64Data?: string;
+  extractedText?: string;
 }
 
 async function startServer() {
@@ -47,7 +48,8 @@ async function startServer() {
   app.post('/api/extract-invoice', async (req: Request, res: Response) => {
     const origin = req.headers.origin;
     const host = req.headers.host;
-    if (!isAllowedOrigin(origin, host)) {
+    const forwardedHost = req.header('x-forwarded-host');
+    if (!isAllowedOrigin(origin, host, forwardedHost)) {
       res.status(403).json({ error: 'Origen no autorizado.' });
       return;
     }
@@ -68,7 +70,7 @@ async function startServer() {
     }
 
     try {
-      const { fileName, mimeType, base64Data } = req.body as ExtractInvoiceBody;
+      const { fileName, mimeType, base64Data, extractedText } = req.body as ExtractInvoiceBody;
 
       if (!base64Data || !mimeType) {
         res.status(400).json({
@@ -88,13 +90,20 @@ async function startServer() {
         fileName,
         mimeType,
         base64Data,
+        extractedText,
       });
 
       res.json(result);
     } catch (error: unknown) {
       console.error('Error en /api/extract-invoice:', error);
       const mapped = mapExtractionError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      if (mapped.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(mapped.retryAfterSeconds));
+      }
+      res.status(mapped.status).json({
+        error: mapped.message,
+        ...(mapped.retryAfterSeconds ? { retryAfterSeconds: mapped.retryAfterSeconds } : {}),
+      });
     }
   });
 

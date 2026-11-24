@@ -15,6 +15,7 @@ interface VercelRequestLike {
     fileName?: string;
     mimeType?: string;
     base64Data?: string;
+    extractedText?: string;
   };
 }
 
@@ -52,7 +53,8 @@ export default async function handler(
 
   const origin = getHeader(req.headers, 'origin');
   const host = getHeader(req.headers, 'host');
-  if (!isAllowedOrigin(origin, host)) {
+  const forwardedHost = getHeader(req.headers, 'x-forwarded-host');
+  if (!isAllowedOrigin(origin, host, forwardedHost)) {
     res.status(403).json({ error: 'Origen no autorizado.' });
     return;
   }
@@ -79,7 +81,7 @@ export default async function handler(
 
   try {
     const body = req.body || {};
-    const { fileName, mimeType, base64Data } = body;
+    const { fileName, mimeType, base64Data, extractedText } = body;
 
     if (!base64Data || !mimeType) {
       res.status(400).json({
@@ -99,12 +101,19 @@ export default async function handler(
       fileName,
       mimeType,
       base64Data,
+      extractedText,
     });
 
     res.status(200).json(result);
   } catch (error: unknown) {
     console.error('Error en Vercel /api/extract-invoice:', error);
     const mapped = mapExtractionError(error);
-    res.status(mapped.status).json({ error: mapped.message });
+    if (mapped.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(mapped.retryAfterSeconds));
+    }
+    res.status(mapped.status).json({
+      error: mapped.message,
+      ...(mapped.retryAfterSeconds ? { retryAfterSeconds: mapped.retryAfterSeconds } : {}),
+    });
   }
 }

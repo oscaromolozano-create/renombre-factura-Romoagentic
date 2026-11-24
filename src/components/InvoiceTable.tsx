@@ -29,6 +29,8 @@ interface InvoiceTableProps {
   onDownloadAllZip: () => void;
   onExportCsv: () => void;
   onClearAll: () => void;
+  onRetryAllFailed?: () => void;
+  cooldownSeconds?: number | null;
   isZipping: boolean;
 }
 
@@ -47,6 +49,8 @@ export const InvoiceTable: React.FC<InvoiceTableProps> = ({
   onDownloadAllZip,
   onExportCsv,
   onClearAll,
+  onRetryAllFailed,
+  cooldownSeconds,
   isZipping,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -59,9 +63,10 @@ export const InvoiceTable: React.FC<InvoiceTableProps> = ({
       (i) => i.status === 'queued' || i.status === 'extracting'
     ).length;
     const ready = items.filter((i) => i.status === 'ready').length;
+    const errorCount = items.filter((i) => i.status === 'error').length;
     const review = items.filter((i) => i.status === 'review' || i.status === 'error').length;
     const selectedCount = items.filter((i) => i.selected).length;
-    return { total, extracting, ready, review, selectedCount };
+    return { total, extracting, ready, errorCount, review, selectedCount };
   }, [items]);
 
   const filteredItems = useMemo(() => {
@@ -159,6 +164,17 @@ export const InvoiceTable: React.FC<InvoiceTableProps> = ({
 
         {/* Batch Export Controls */}
         <div className="flex flex-wrap items-center gap-2">
+          {stats.errorCount > 0 && onRetryAllFailed && (
+            <button
+              type="button"
+              onClick={onRetryAllFailed}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Reintentar errores ({stats.errorCount})
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onExportCsv}
@@ -201,13 +217,31 @@ export const InvoiceTable: React.FC<InvoiceTableProps> = ({
 
       {/* Extraction Progress Notice if active */}
       {stats.extracting > 0 && (
-        <div className="px-5 py-2.5 bg-blue-50/70 border-b border-blue-100 flex items-center gap-2.5 text-xs text-blue-900">
-          <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700 shrink-0" />
-          <span>
-            Leyendo datos de {stats.extracting}{' '}
-            {stats.extracting === 1 ? 'factura' : 'facturas'}... Puedes ir revisando o
-            descargando las que ya están listas.
-          </span>
+        <div
+          className={`px-5 py-2.5 border-b flex items-center gap-2.5 text-xs ${
+            cooldownSeconds && cooldownSeconds > 0
+              ? 'bg-amber-50/80 border-amber-200 text-amber-900'
+              : 'bg-blue-50/70 border-blue-100 text-blue-900'
+          }`}
+        >
+          <Loader2
+            className={`w-3.5 h-3.5 animate-spin shrink-0 ${
+              cooldownSeconds && cooldownSeconds > 0 ? 'text-amber-700' : 'text-blue-700'
+            }`}
+          />
+          {cooldownSeconds && cooldownSeconds > 0 ? (
+            <span>
+              Límite temporal gratuito alcanzado. Pausa automática de{' '}
+              <strong className="tabular-nums">{cooldownSeconds} s</strong> para reanudar sin
+              errores...
+            </span>
+          ) : (
+            <span>
+              Leyendo datos de {stats.extracting}{' '}
+              {stats.extracting === 1 ? 'factura' : 'facturas'}... Puedes ir revisando o
+              descargando las que ya están listas.
+            </span>
+          )}
         </div>
       )}
 
